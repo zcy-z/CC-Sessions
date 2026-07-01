@@ -95,6 +95,16 @@ body { font: 14px/1.6 -apple-system, 'Segoe UI', system-ui, sans-serif;
   color: var(--text3); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 12px;
   transition: all .15s; }
 .delete-btn:hover { background: var(--red-bg); color: var(--red); border-color: var(--red); }
+.compress-btn { padding: 7px 16px; background: transparent;
+  color: var(--text3); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 12px;
+  transition: all .15s; }
+.compress-btn:hover { background: var(--accent-bg); color: var(--accent); border-color: var(--accent); }
+.compress-btn:disabled { opacity: .5; cursor: not-allowed; }
+.restore-btn { padding: 7px 16px; background: transparent;
+  color: var(--green); border: 1px solid var(--green); border-radius: 6px; cursor: pointer; font-size: 12px;
+  transition: all .15s; }
+.restore-btn:hover { background: var(--green-bg); }
+.restore-btn:disabled { opacity: .5; cursor: not-allowed; }
 .delete-btn.confirm { background: var(--red); color: #fff; border-color: var(--red); font-weight: 600; }
 
 .messages { flex: 1; overflow-y: auto; padding: 24px 28px; }
@@ -121,6 +131,32 @@ body { font: 14px/1.6 -apple-system, 'Segoe UI', system-ui, sans-serif;
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+
+/* Modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  width: 720px; max-width: 90vw; max-height: 80vh; display: flex; flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+.modal-header { padding: 16px 20px; border-bottom: 1px solid var(--border); font-weight: 600;
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.modal-close { background: none; border: none; cursor: pointer; color: var(--text3);
+  font-size: 18px; padding: 2px 6px; border-radius: 4px; transition: all .15s; }
+.modal-close:hover { background: var(--bg); color: var(--text); }
+.modal-body { padding: 20px; overflow-y: auto; font-size: 13px; line-height: 1.8; color: var(--text2); }
+.modal-body.md h1 { font-size: 16px; color: var(--text); margin: 0 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.modal-body.md h2 { font-size: 14px; color: var(--text); margin: 20px 0 8px; }
+.modal-body.md p { margin: 6px 0; }
+.modal-body.md ul, .modal-body.md ol { padding-left: 20px; margin: 6px 0; }
+.modal-body.md blockquote { border-left: 3px solid var(--accent); padding: 6px 12px; margin: 8px 0;
+  background: var(--accent-bg); border-radius: 0 4px 4px 0; color: var(--text); }
+.modal-body.md strong { color: var(--text); }
+.modal-body.md code { background: var(--bg); padding: 1px 5px; border-radius: 3px; font-size: 12px;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; }
+.modal-body.md hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+.modal-body.md table { border-collapse: collapse; margin: 8px 0; font-size: 12px; }
+.modal-body.md th, .modal-body.md td { border: 1px solid var(--border); padding: 5px 10px; }
+.modal-body.md th { background: var(--bg); color: var(--text); }
 
 /* Animations */
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -155,6 +191,7 @@ body { font: 14px/1.6 -apple-system, 'Segoe UI', system-ui, sans-serif;
     </div>
   </div>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 let sessions = [], activeId = null, debounce = null, currentCmd = '';
 let sortMode = localStorage.getItem('cc-sort') || 'smart';
@@ -229,10 +266,13 @@ async function select(id) {
         <span title="${esc(cwd)}">📁 ${esc(data.project)}</span>
         <span>🕐 ${data.time}</span>
         <span>💬 ${data.messages.length} 条对话</span>
+        <span>📦 ${data.file_size} MB</span>
         <span>🔑 ${data.id.substring(0, 8)}</span>
       </div>
       <div class="detail-actions">
         <button class="resume-btn" onclick="copyCurrentCmd(this)">${esc(currentCmd)}</button>
+        <button class="compress-btn" onclick="generateSummary(this)">📝 ${data.has_summary ? '重新生成摘要' : '生成摘要'}</button>
+        ${data.has_summary ? '<button class="restore-btn" onclick="showSummary()">📄 查看摘要</button>' : ''}
         <button class="delete-btn" id="del-btn" onclick="deleteSession(this)">🗑 删除</button>
       </div>
     </div>
@@ -307,6 +347,37 @@ async function togglePinById(id) {
     body: JSON.stringify({id: id})
   });
   loadSessions(document.getElementById('search').value);
+}
+
+async function generateSummary(btn) {
+  btn.textContent = '生成中...';
+  btn.disabled = true;
+  const res = await fetch('/api/summary', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: activeId})
+  });
+  const data = await res.json();
+  if (data.ok) {
+    const mb = (data.size / 1024).toFixed(2);
+    btn.textContent = `✓ 已生成 (${mb} MB)`;
+    btn.classList.add('copied');
+    setTimeout(() => select(activeId), 3000);
+  } else {
+    btn.textContent = '生成失败';
+    btn.disabled = false;
+  }
+}
+
+async function showSummary() {
+  const res = await fetch(`/api/summary-content/${activeId}`);
+  const data = await res.json();
+  if (!data.ok) return;
+  const html = marked.parse(data.content);
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `<div class="modal"><div class="modal-header">会话摘要<button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button></div><div class="modal-body md">${html}</div></div>`;
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+  document.body.appendChild(modal);
 }
 
 async function deleteSession(btn) {

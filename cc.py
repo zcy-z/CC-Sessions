@@ -14,6 +14,7 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CHAT_LOG_DIR = Path.home() / "Desktop" / "提示词系列" / "聊天记录"
 NAMES_FILE = Path.home() / ".claude" / "cc-session-names.json"
 PINNED_FILE = Path.home() / ".claude" / "cc-pinned.json"
+BACKUP_DIR = Path("D:/cc-sessions-backup")
 TZ = timezone(timedelta(hours=8))
 
 def load_names():
@@ -338,6 +339,8 @@ def session_to_dict(s):
     pinned = load_pinned()
     custom = names.get(s["id"], "")
     title = custom or s["title"] or s["first_msg"][:80] or "(空)"
+    jsonl = PROJECTS_DIR / s["project_dir"] / f"{s['id']}.jsonl"
+    fsize = round(jsonl.stat().st_size / 1024 / 1024, 2) if jsonl.exists() else 0
     return {
         "id": s["id"],
         "title": title,
@@ -350,7 +353,80 @@ def session_to_dict(s):
         "timestamp": s["timestamp"] or "",
         "msg_count": s["msg_count"],
         "first_msg": s["first_msg"],
+        "file_size": fsize,
     }
+
+def generate_summary(jsonl_path):
+    """Generate a concise markdown summary of a session and save to BACKUP_DIR."""
+    jsonl_path = Path(jsonl_path)
+    sid = jsonl_path.stem
+    title, first_ts, user_msgs, pairs = "", "", [], []
+    current_user = None
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = entry.get("type")
+                ts = entry.get("timestamp", "")
+                if t == "ai-title":
+                    title = entry.get("aiTitle", "")
+                elif t == "user" and not entry.get("isMeta"):
+                    content = extract_content(entry.get("message", {}).get("content", ""))
+                    if content and not content.startswith("<"):
+                        if not first_ts:
+                            first_ts = ts
+                        current_user = content
+                        user_msgs.append(content)
+                elif t == "assistant" and current_user:
+                    msg = entry.get("message", {})
+                    for block in msg.get("content", []):
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "").strip()
+                            if text:
+                                pairs.append((current_user, text[:300]))
+                                current_user = None
+                                break
+    except Exception as e:
+        return None, str(e)
+
+    project_dir = jsonl_path.parent.name
+    cwd = ""
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                entry = json.loads(line.strip())
+                if entry.get("type") == "user":
+                    cwd = entry.get("cwd", "")
+                    break
+    except Exception:
+        pass
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = BACKUP_DIR / f"{sid}.md"
+    lines = [
+        f"# {title or sid[:12]}",
+        f"",
+        f"- **项目**: {pretty_project(project_dir, cwd)}",
+        f"- **时间**: {fmt_time(first_ts)}",
+        f"- **消息数**: {len(user_msgs)}",
+        f"",
+    ]
+    for i, (q, a) in enumerate(pairs, 1):
+        lines.append(f"**{i}. {q[:120]}**")
+        lines.append(f"")
+        lines.append(f"> {a}")
+        lines.append(f"")
+    # Questions without assistant response
+    for q in user_msgs[len(pairs):]:
+        lines.append(f"- {q[:120]}")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path, None
 
 def _load_html():
     html_path = Path(__file__).parent / "cc.html"
@@ -384,9 +460,22 @@ def cmd_serve(args):
                 if found:
                     s = found[0]
                     msgs = get_session_messages(s["project_dir"], s["id"])
-                    self._json({**session_to_dict(s), "messages": msgs})
+                    backup = BACKUP_DIR / f"{s['id']}.jsonl"
+                    summary = BACKUP_DIR / f"{s['id']}.md"
+                    jsonl = PROJECTS_DIR / s["project_dir"] / f"{s['id']}.jsonl"
+                    self._json({**session_to_dict(s), "messages": msgs,
+                                "has_backup": backup.exists(),
+                                "has_summary": summary.exists()})
                 else:
                     self._json({"error": "not found"}, 404)
+            elif path.startswith("/api/summary-content/"):
+                sid = path.split("/")[-1]
+                summary = BACKUP_DIR / f"{sid}.md"
+                if summary.exists():
+                    content = summary.read_text(encoding="utf-8")
+                    self._json({"ok": True, "content": content})
+                else:
+                    self._json({"error": "no summary"}, 404)
             else:
                 self._resp(404, "text/plain", b"Not Found")
         def do_POST(self):
@@ -449,6 +538,27 @@ def cmd_serve(args):
                     pinned.append(sid)
                 save_pinned(pinned)
                 self._json({"ok": True, "pinned": sid in pinned})
+            elif parsed.path == "/api/summary":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8", errors="replace"))
+                sid = body.get("id", "")
+                if not sid:
+                    self._json({"error": "missing id"}, 400)
+                    return
+                files = [f for f in glob.glob(str(PROJECTS_DIR / "**" / f"{sid}.jsonl"), recursive=True)
+                         if "subagents" not in f]
+                if not files:
+                    self._json({"error": "session not found"}, 404)
+                    return
+                try:
+                    out_path, err = generate_summary(files[0])
+                    if err:
+                        self._json({"error": err}, 500)
+                    else:
+                        fsize = round(out_path.stat().st_size / 1024, 1)
+                        self._json({"ok": True, "path": str(out_path), "size": fsize})
+                except Exception as e:
+                    self._json({"error": str(e)}, 500)
             else:
                 self._resp(404, "text/plain", b"Not Found")
         def _json(self, data, code=200):
